@@ -122,7 +122,7 @@ def run_simulation(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PPI-IPCW simulation with Limix imputation")
-    parser.add_argument("--B", type=int, default=100)
+    parser.add_argument("--B", type=int, default=10)
     parser.add_argument("--n_pretrain", type=int, default=250)
     parser.add_argument("--n_infer", type=int, default=5000)
     parser.add_argument("--obs_rate", type=float, default=0.1)

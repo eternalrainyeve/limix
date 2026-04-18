@@ -75,11 +75,10 @@ def split_pretrain_inference(
     r[observed_idx] = 1
     inferencing["R"] = r
 
-    # Keep true values in X4/X5 and create masked copies for Limix inference input.
-    inferencing["X4_input"] = inferencing["X4"]
-    inferencing["X5_input"] = inferencing["X5"]
-    inferencing.loc[inferencing["R"] == 0, "X4_input"] = np.nan
-    inferencing.loc[inferencing["R"] == 0, "X5_input"] = np.nan
+    # For PPI-IPCW with predicted X2 in all inferencing samples, always mask X4/X5 inputs.
+    # True X4/X5 are kept in original columns for the R=1 correction term only.
+    inferencing["X4_input"] = np.nan
+    inferencing["X5_input"] = np.nan
 
     return SimulationSplit(pretraining=pretraining, inferencing=inferencing)
 

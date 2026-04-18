@@ -66,11 +66,8 @@ class LimixX2Imputer:
 
     def impute(self, pretraining: pd.DataFrame, inferencing: pd.DataFrame) -> LimixImputeResult:
         x_train = pretraining[FEATURE_COLS].to_numpy(dtype=np.float32)
-        y_train_raw = pretraining["Y"].to_numpy(dtype=np.float32)
-        y_std = float(np.std(y_train_raw))
-        if y_std <= 0:
-            y_std = 1.0
-        y_train = (y_train_raw - float(np.mean(y_train_raw))) / y_std
+        # Use constant placeholder labels to avoid injecting outcome information into imputation.
+        y_train = np.zeros(len(pretraining), dtype=np.float32)
 
         x_test = inferencing[INPUT_FEATURE_COLS].copy()
         x_test = x_test.rename(columns={"X4_input": "X4", "X5_input": "X5"})
@@ -85,7 +82,7 @@ class LimixX2Imputer:
 
         reconstructed_infer = reconstructed[-len(inferencing) :]  # limix输入和输出的行数都是pre-training的行数+inference的行数；这里取inference的部分
 
-        out = inferencing.copy()
+        out = inferencing.copy()  # 默认深拷贝，对于pd中的数据，copy是深拷贝，对于np中dataframe
         out["X4_hat"] = reconstructed_infer[:, 3]
         out["X5_hat"] = reconstructed_infer[:, 4]
 
