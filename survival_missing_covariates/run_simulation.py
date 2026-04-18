@@ -41,6 +41,8 @@ def run_simulation(
     fixed_pi: float = 0.1,
     random_state: int = 0,
     model_path: str | None = None,
+    print_imputation_preview: bool = False,
+    preview_rows: int = 5,
 ) -> Dict[str, object]:
     print("Computing true RMST...")
     true_rmst = _compute_true_rmst(seed=233, n_true=50000)
@@ -70,6 +72,15 @@ def run_simulation(
 
         impute_result = imputer.impute(pretraining=split.pretraining, inferencing=infer_df)
         infer_imputed = impute_result.inferencing_with_imputation
+
+        if print_imputation_preview:
+            before_cols = ["X1", "X2", "X3", "X4", "X5", "R", "X4_input", "X5_input", "Y", "Delta"]
+            after_cols = ["X1", "X2", "X3", "X4", "X5", "X4_hat", "X5_hat", "R", "Y", "Delta"]
+            print(f"\n[Iteration {iter_idx}] Inferencing before LimiX imputation (head={preview_rows})")
+            print(infer_df[before_cols].head(preview_rows).to_string(index=False))
+            print(f"\n[Iteration {iter_idx}] Inferencing after LimiX imputation (head={preview_rows})")
+            print(infer_imputed[after_cols].head(preview_rows).to_string(index=False))
+            print("")
 
         for method in methods:
             sc_result = estimate_sc_stratified_crossfit(
@@ -122,7 +133,7 @@ def run_simulation(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PPI-IPCW simulation with Limix imputation")
-    parser.add_argument("--B", type=int, default=10)
+    parser.add_argument("--B", type=int, default=100)
     parser.add_argument("--n_pretrain", type=int, default=250)
     parser.add_argument("--n_infer", type=int, default=5000)
     parser.add_argument("--obs_rate", type=float, default=0.1)
@@ -133,6 +144,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random_state", type=int, default=0)
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--save_json", type=str, default="")
+    parser.add_argument("--print_imputation_preview", action="store_true")
+    parser.add_argument("--preview_rows", type=int, default=5)
     return parser.parse_args()
 
 
@@ -149,6 +162,8 @@ if __name__ == "__main__":
         fixed_pi=args.fixed_pi,
         random_state=args.random_state,
         model_path=args.model_path,
+        print_imputation_preview=args.print_imputation_preview,
+        preview_rows=args.preview_rows,
     )
     if args.save_json:
         out_path = os.path.abspath(args.save_json)

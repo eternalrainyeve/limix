@@ -71,7 +71,13 @@ class LimixX2Imputer:
 
         x_test = inferencing[INPUT_FEATURE_COLS].copy()
         x_test = x_test.rename(columns={"X4_input": "X4", "X5_input": "X5"})
-        x_test_np = x_test.to_numpy(dtype=np.float32)
+
+        # If a column is all-NaN in x_test, Limix's FilterValidFeatures will drop it.
+        # Append one real pretraining sample as an anchor row to keep all feature columns valid,
+        # then remove that row after reconstruction.
+        anchor_row = pretraining[FEATURE_COLS].iloc[[0]].copy()
+        x_test_aug = pd.concat([x_test, anchor_row], ignore_index=True)
+        x_test_np = x_test_aug.to_numpy(dtype=np.float32)
 
         _, reconstructed = self.predictor.predict(
             x_train=x_train,
@@ -80,7 +86,9 @@ class LimixX2Imputer:
             task_type="Regression",
         )
 
-        reconstructed_infer = reconstructed[-len(inferencing) :]  # limix输入和输出的行数都是pre-training的行数+inference的行数；这里取inference的部分
+        # Predictor output covers x_train + x_test_aug. Remove the synthetic anchor row.
+        reconstructed_test_aug = reconstructed[-len(x_test_aug) :]
+        reconstructed_infer = reconstructed_test_aug[:-1]
 
         out = inferencing.copy()  # 默认深拷贝，对于pd中的数据，copy是深拷贝，对于np中dataframe
         out["X4_hat"] = reconstructed_infer[:, 3]
