@@ -41,23 +41,46 @@ from inference.predictor import LimiXPredictor  # noqa: E402
 # --- DGP: matches R (MASS mvrnorm + Weibull, truncation at tau) -----------------
 
 
+import numpy as np
+import pandas as pd
+
 def generate_data(
     n: int,
     rng: np.random.Generator,
     rho: float = 0.7,
     tau: float = 2.0,
+    c_base_hazard: float = 1.0,  # 🌟 调节删失率参数：值越大，删失率越高
 ) -> pd.DataFrame:
+    """
+    Explicit Cox PH DGP using Inverse Probability Integral Transform (Bender et al., 2005).
+    T = (-log(U) / (lambda * exp(beta'X)))^(1/nu)
+    """
+    # 1. 生成协变量
     cov = np.array([[1.0, rho], [rho, 1.0]], dtype=np.float64)
     x1, x2 = rng.multivariate_normal(np.zeros(2), cov, size=n).T
-    z1 = 1.5 * x1 + 1.5 * x2
-    lam_t = np.exp(z1)
-    t_true = (1.0 / np.sqrt(lam_t)) * (-np.log(rng.random(n))) ** 0.5
+
+    # 2. 显式 Cox PH 生成真实事件时间 T
+    beta_t = np.array([1.5, 1.5], dtype=np.float64)
+    risk_score_t = np.exp(beta_t[0] * x1 + beta_t[1] * x2)
+    
+    nu_t = 2.0        # 基准风险形状参数 (Shape)
+    lambda_t = 1.0    # 基准风险尺度乘子
+    u_t = rng.random(n) # Uniform(0, 1)
+    
+    t_true = (-np.log(u_t) / (lambda_t * risk_score_t)) ** (1.0 / nu_t)
     t_trunc = np.minimum(t_true, tau)
 
-    z2 = 0.4 * x1 + 0.8 * x2
-    lam_c = np.exp(z2)
-    c = (1.5 / lam_c) * (-np.log(rng.random(n))) ** (1.0 / 1.5)
+    # 3. 显式 Cox PH 生成删失时间 C
+    beta_c = np.array([0.4, 0.8], dtype=np.float64)
+    risk_score_c = np.exp(beta_c[0] * x1 + beta_c[1] * x2)
+    
+    nu_c = 1.5
+    lambda_c = c_base_hazard  # 调节项
+    u_c = rng.random(n)
+    
+    c = (-np.log(u_c) / (lambda_c * risk_score_c)) ** (1.0 / nu_c)
 
+    # 4. 组装观测数据
     y = np.minimum(t_trunc, c)
     delta = (t_trunc <= c).astype(np.float64)
 
@@ -72,10 +95,13 @@ def generate_data(
     )
 
 
-def truth_theta0_rmst(rng: np.random.Generator, n_big: int, tau: float) -> float:
+def truth_theta0_rmst(
+    rng: np.random.Generator, n_big: int, tau: float
+) -> tuple[float, float]:
     """E[T_true] = E[min(T, tau)] under DGP. Same role as R big_data mean."""
     d = generate_data(n_big, rng, tau=tau)
-    return float(d["T_true"].mean())
+    censor_rate = 1 - float(d["Delta"].mean())
+    return float(d["T_true"].mean()), censor_rate
 
 
 def _cumulative_baseline_on_grid(
@@ -140,7 +166,7 @@ def compute_scores(
 
     s_t_mat = np.exp(-np.outer(risk_t, h0_t))
     s_c_mat = np.exp(-np.outer(risk_c, h0_c))
-    s_c_mat = np.maximum(s_c_mat, 0.05)
+    s_c_mat = np.maximum(s_c_mat, 1e-5)
     s_t_mat = np.maximum(s_t_mat, 1e-5)
 
     area_s_t = s_t_mat * dt[None, :]
@@ -351,17 +377,17 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Bivariate survival IPCW/DR/PPI with LimiX imputing X2|X1",
     )
-    p.add_argument("--m", type=int, default=500, help="Monte Carlo replicates")
+    p.add_argument("--m", type=int, default=20, help="Monte Carlo replicates")
     p.add_argument(
         "--seed-gold", type=int, default=999, help="Random seed for theta0 reference"
     )
     p.add_argument(
-        "--theta-n", type=int, default=1_000_000, help="N for E[T_true] reference"
+        "--theta-n", type=int, default=10_000_000, help="N for E[T_true] reference"
     )
     p.add_argument("--n-pre", type=int, default=500)
-    p.add_argument("--n-inf", type=int, default=10_000)
+    p.add_argument("--n-inf", type=int, default=10000)
     p.add_argument("--p-label", type=float, default=0.1)
-    p.add_argument("--tau", type=float, default=2.0)
+    p.add_argument("--tau", type=float, default=2)
     p.add_argument("-K", "--k-folds", type=int, default=5, dest="k_folds")
     p.add_argument(
         "--model_path",
@@ -407,8 +433,8 @@ def main() -> None:
     except OSError:
         pass
     rng_g = np.random.default_rng(args.seed_gold)
-    theta0 = truth_theta0_rmst(rng_g, args.theta_n, args.tau)
-    print("theta0 (E[T_true]):", theta0, flush=True)
+    theta0, censor_rate = truth_theta0_rmst(rng_g, args.theta_n, args.tau)
+    print("theta0 (E[T_true]):", theta0, "Censor rate:", censor_rate, flush=True)
 
     ck = load_or_fetch_ckpt(
         (args.model_path or None) if args.model_path else None, root
@@ -437,11 +463,11 @@ def main() -> None:
     names = [
         "IPCW_Oracle",
         "IPCW_Classical",
-        "IPCW_Impute",
+        "IPCW_Naive",
         "IPCW_PPI",
         "DR_Oracle",
         "DR_Classical",
-        "DR_Impute",
+        "DR_Naive",
         "DR_PPI",
     ]
     res = np.zeros((M, len(names)), dtype=np.float64)
@@ -458,17 +484,19 @@ def main() -> None:
         )
 
     bias = res.mean(axis=0) - theta0
-    ese = res.std(axis=0, ddof=0)
-    rmse = np.sqrt(bias**2 + ese**2)
+    esd = res.std(axis=0, ddof=0)
+    rmse = np.sqrt(bias**2 + esd**2)
     out = pd.DataFrame(
         {
             "Method": [f"{i+1}. {n}" for i, n in enumerate(names)],
             "Bias": np.round(bias, 6),
-            "ESE": np.round(ese, 6),
+            "ESD": np.round(esd, 6),
             "RMSE": np.round(rmse, 6),
         }
     )
     print(f"\n--- Final Unified Simulation Results (M = {M}) ---\n")
+    print(f"missing rate: {1 - args.p_label}")
+    print(f"censor rate: {censor_rate}")
     print(out.to_string(index=False))
 
 
