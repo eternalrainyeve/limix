@@ -18,15 +18,12 @@ import os
 import sys
 import warnings
 from typing import List, Optional
+from lifelines import CoxPHFitter
 
 import numpy as np
 import pandas as pd
 import torch
 
-try:
-    from lifelines import CoxPHFitter
-except ImportError as e:
-    raise SystemExit("Please install lifelines, e.g.: pip install lifelines") from e
 
 # LimiX package root (this file: LimiX/examples/...)
 _LIMIX_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -41,35 +38,40 @@ from inference.predictor import LimiXPredictor  # noqa: E402
 def generate_data(
     n: int,
     rng: np.random.Generator,
-    rho: float = 0.8,
-    tau: float = 1.5,
-    c_base_hazard: float = 2.2
+    rho: float = 0.7,
+    tau: float = 2,
+    c_base_hazard: float = 1.35
 ) -> pd.DataFrame:
     """Explicit Cox PH DGP using Inverse Probability Integral Transform"""
     # 1. 生成协变量
-    cov = np.array([[1.0, rho], [rho, 1.0]], dtype=np.float64)
+    cov = np.array([[1.0, rho], [rho, 1.0]])
     x1, x2 = rng.multivariate_normal(np.zeros(2), cov, size=n).T
 
     # 2. 显式 Cox PH 生成真实事件时间 T
-    beta_t = np.array([1.5, 1.5], dtype=np.float64)
+    beta_t = np.array([-0.5, 1.5])
     risk_score_t = np.exp(beta_t[0] * x1 + beta_t[1] * x2)
     
-    nu_t = 2.0        
-    lambda_t = 1.0    
+    nu_t = 2.0  # shape     
+    lambda_t = 1.0  # scale
     u_t = rng.random(n) 
     
     t_true = (-np.log(u_t) / (lambda_t * risk_score_t)) ** (1.0 / nu_t)
     t_trunc = np.minimum(t_true, tau)
+    # 算并打印 85% 分位数（基于 t_true）
+    q85 = np.quantile(t_true, 0.85)
+    print(f"85th percentile of t_true: {q85:.4f}")
 
     # 3. 显式 Cox PH 生成删失时间 C
-    beta_c = np.array([1.0, 1.0], dtype=np.float64)
+    beta_c = np.array([0.2, 0.4])
     risk_score_c = np.exp(beta_c[0] * x1 + beta_c[1] * x2)
     
-    nu_c = 1.5
+    nu_c = 1.0
     lambda_c = c_base_hazard  
     u_c = rng.random(n)
     
     c = (-np.log(u_c) / (lambda_c * risk_score_c)) ** (1.0 / nu_c)
+    q85_c = np.quantile(c, 0.85)
+    print(f"85th percentile of c: {q85_c:.4f}")
 
     # 4. 组装观测数据
     y = np.minimum(t_trunc, c)
@@ -195,17 +197,11 @@ def fit_cox_c(frame: pd.DataFrame, x_cols: List[str]) -> CoxPHFitter:
 def limix_impute_x2(
     pre: pd.DataFrame, inf: pd.DataFrame, predictor: LimiXPredictor
 ) -> np.ndarray:
-    x_tr = pre[["X1", "X2"]].to_numpy(np.float32)
-    y_tr = pre["X2"].to_numpy(dtype=np.float32, copy=True).ravel()
-    n_inf = len(inf)
-    x_te = np.array(inf[["X1", "X2"]], dtype=np.float32, copy=True)
-    x_te[:, 1] = np.nan
-    anc = pre[["X1", "X2"]].to_numpy(np.float32)[:1]
-    x_aug = np.vstack([x_te, anc])
-    _, mask_pred = predictor.predict(x_tr, y_tr, x_aug, task_type="Regression")
-    n_tr = x_tr.shape[0]
-    x2_hat = mask_pred[n_tr : n_tr + n_inf, 1]
-    return np.asarray(x2_hat, dtype=np.float64)
+    x1_tr = pre[["X1"]].to_numpy(np.float64)
+    x2_tr = pre[["X2"]].to_numpy(np.float64).ravel()
+    x1_te = inf[["X1"]].to_numpy(np.float64)
+    x2_hat = predictor.predict(x1_tr, x2_tr, x1_te, task_type="Regression")
+    return x2_hat.to('cpu').numpy().ravel()
 
 
 # ==============================================================================
@@ -399,7 +395,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-pre", type=int, default=500)
     p.add_argument("--n-inf", type=int, default=10000)
     p.add_argument("--p-label", type=float, default=0.1)
-    p.add_argument("--tau", type=float, default=1.5)
+    p.add_argument("--tau", type=float, default=1.3)
     p.add_argument("--model_path", type=str, default="")
     p.add_argument("--inference_config", type=str, default="")
     p.add_argument("--device", type=str, default="auto")
@@ -426,7 +422,6 @@ def main() -> None:
     pred = LimiXPredictor(
         device=dev,
         model_path=ck,
-        mask_prediction=True,
         inference_config=icfg,
         seed=args.predictor_seed,
     )
