@@ -1,5 +1,6 @@
 """
-Bivariate survival simulation: IPCW, doubly robust, and PPI-Old (Ablation Test)
+Five-covariate survival simulation with LimiX missing value imputation:
+IPCW, doubly robust, and PPI-Old (Ablation Test)
 2-Fold Cross-Fitting + SEPARATE NUISANCE MODELS FOR EVERY TERM
 
 Run in conda env: limix_test
@@ -32,24 +33,36 @@ if _LIMIX_ROOT not in sys.path:
 from inference.predictor import LimiXPredictor  # noqa: E402
 
 
+COVARIATE_COLS = ["X1", "X2", "X3", "X4", "X5"]
+IMPUTED_COLS = ["X4", "X5"]
+
+
 # ==============================================================================
 # 1. 数据生成函数 (DGP)
 # ==============================================================================
 def generate_data(
     n: int,
     rng: np.random.Generator,
-    rho: float = 0.7,
-    tau: float = 2,
-    c_base_hazard: float = 1.35
+    rho: float = 0.5,
+    tau: float = 1.4,
+    c_base_hazard: float = 1.4992,
+    verbose: bool = True,
 ) -> pd.DataFrame:
     """Explicit Cox PH DGP using Inverse Probability Integral Transform"""
     # 1. 生成协变量
-    cov = np.array([[1.0, rho], [rho, 1.0]])
-    x1, x2 = rng.multivariate_normal(np.zeros(2), cov, size=n).T
+    cov = np.full((5, 5), rho, dtype=np.float64)
+    np.fill_diagonal(cov, 1.0)
+    x1, x2, x3, x4, x5 = rng.multivariate_normal(np.zeros(5), cov, size=n).T
 
     # 2. 显式 Cox PH 生成真实事件时间 T
-    beta_t = np.array([-0.5, 1.5])
-    risk_score_t = np.exp(beta_t[0] * x1 + beta_t[1] * x2)
+    beta_t = np.array([-0.5, 0.8, 0.4, 2.12, -1.33])
+    risk_score_t = np.exp(
+        beta_t[0] * x1
+        + beta_t[1] * x2
+        + beta_t[2] * x3
+        + beta_t[3] * x4
+        + beta_t[4] * x5
+    )
     
     nu_t = 2.0  # shape     
     lambda_t = 1.0  # scale
@@ -59,11 +72,20 @@ def generate_data(
     t_trunc = np.minimum(t_true, tau)
     # 算并打印 85% 分位数（基于 t_true）
     q85 = np.quantile(t_true, 0.85)
-    print(f"85th percentile of t_true: {q85:.4f}")
+    if verbose:
+        print(f"85th percentile of t_true: {q85:.4f}")
 
     # 3. 显式 Cox PH 生成删失时间 C
-    beta_c = np.array([0.2, 0.4])
-    risk_score_c = np.exp(beta_c[0] * x1 + beta_c[1] * x2)
+    # 略增大 X4/X5 对删失 hazard 的贡献：Naive 全程用 Xhat 拟合 cox_c，IPCW 权重更易偏；
+    # Classical 在 R=1 上用真 X，相对更稳。
+    beta_c = np.array([0.13, 0.22, -0.08, 0.42, -0.35])
+    risk_score_c = np.exp(
+        beta_c[0] * x1
+        + beta_c[1] * x2
+        + beta_c[2] * x3
+        + beta_c[3] * x4
+        + beta_c[4] * x5
+    )
     
     nu_c = 1.0
     lambda_c = c_base_hazard  
@@ -71,7 +93,8 @@ def generate_data(
     
     c = (-np.log(u_c) / (lambda_c * risk_score_c)) ** (1.0 / nu_c)
     q85_c = np.quantile(c, 0.85)
-    print(f"85th percentile of c: {q85_c:.4f}")
+    if verbose:
+        print(f"85th percentile of c: {q85_c:.4f}")
 
     # 4. 组装观测数据
     y = np.minimum(t_trunc, c)
@@ -81,6 +104,9 @@ def generate_data(
         {
             "X1": x1,
             "X2": x2,
+            "X3": x3,
+            "X4": x4,
+            "X5": x5,
             "T_true": t_trunc,
             "Y": y,
             "Delta": delta,
@@ -90,7 +116,7 @@ def generate_data(
 def truth_theta0_rmst(
     rng: np.random.Generator, n_big: int, tau: float
 ) -> tuple[float, float]:
-    d = generate_data(n_big, rng, tau=tau)
+    d = generate_data(n_big, rng, tau=tau, verbose=False)
     censor_rate = 1 - float(d["Delta"].mean())
     return float(d["T_true"].mean()), censor_rate
 
@@ -194,14 +220,36 @@ def fit_cox_c(frame: pd.DataFrame, x_cols: List[str]) -> CoxPHFitter:
         cph.fit(d, duration_col="Y", event_col="eventC", show_progress=False)
     return cph
 
-def limix_impute_x2(
-    pre: pd.DataFrame, inf: pd.DataFrame, predictor: LimiXPredictor
+def limix_impute_x4x5(
+    pre: pd.DataFrame,
+    inf: pd.DataFrame,
+    predictor: LimiXPredictor,
+    n_anchor: int = 16,
 ) -> np.ndarray:
-    x1_tr = pre[["X1"]].to_numpy(np.float64)
-    x2_tr = pre[["X2"]].to_numpy(np.float64).ravel()
-    x1_te = inf[["X1"]].to_numpy(np.float64)
-    x2_hat = predictor.predict(x1_tr, x2_tr, x1_te, task_type="Regression")
-    return x2_hat.to('cpu').numpy().ravel()
+    x_train = pre[COVARIATE_COLS].to_numpy(np.float64)
+    anchor_y = np.zeros(len(x_train), dtype=np.float64)
+
+    n_anchor = max(1, min(n_anchor, len(pre)))
+    anchor_x = pre[COVARIATE_COLS].iloc[:n_anchor].to_numpy(np.float64)
+    inf_x = inf[COVARIATE_COLS].to_numpy(np.float64)
+    inf_x[:, [COVARIATE_COLS.index(col) for col in IMPUTED_COLS]] = np.nan
+
+    # Anchor rows keep X4/X5 present in the test block, so FilterValidFeatures
+    # does not delete the fully-missing target columns before reconstruction.
+    x_test = np.vstack([anchor_x, inf_x])
+    _, reconstructed_x = predictor.predict(
+        x_train,
+        anchor_y,
+        x_test,
+        task_type="Regression",
+    )
+    if reconstructed_x is None:
+        raise RuntimeError("LimiX predictor did not return reconstructed_X; set mask_prediction=True.")
+
+    reconstructed_test = reconstructed_x[-len(x_test):]
+    imputed_inf = reconstructed_test[n_anchor:]
+    imputed_indices = [COVARIATE_COLS.index(col) for col in IMPUTED_COLS]
+    return imputed_inf[:, imputed_indices].astype(np.float64, copy=False)
 
 
 # ==============================================================================
@@ -211,7 +259,7 @@ def compute_fold_theta_separate(
     dt_train: pd.DataFrame, dt_target: pd.DataFrame, tau: float
 ) -> dict:
     
-    x_cols = ["X1", "X2"]
+    x_cols = COVARIATE_COLS
     
     # 布尔索引
     mask_r1_train = dt_train["R"] == 1.0
@@ -235,11 +283,13 @@ def compute_fold_theta_separate(
     # -------------------------------------------------------------------------
     # Baseline 2: Naive Impute
     # -------------------------------------------------------------------------
-    # 使用 Proxy 技巧：将真实 X2 替换为 Xhat2
+    # 使用 Proxy 技巧：将真实 X4/X5 替换为 Xhat4/Xhat5
     dt_train_proxy = dt_train.copy()
-    dt_train_proxy["X2"] = dt_train["Xhat2"]
+    dt_train_proxy["X4"] = dt_train["Xhat4"]
+    dt_train_proxy["X5"] = dt_train["Xhat5"]
     dt_target_proxy = dt_target.copy()
-    dt_target_proxy["X2"] = dt_target["Xhat2"]
+    dt_target_proxy["X4"] = dt_target["Xhat4"]
+    dt_target_proxy["X5"] = dt_target["Xhat5"]
     
     cox_t_naive = fit_cox_t(dt_train_proxy, x_cols)
     cox_c_naive = fit_cox_c(dt_train_proxy, x_cols)
@@ -261,7 +311,7 @@ def compute_fold_theta_separate(
     else:
         ppi_t1_ipcw, ppi_t1_dr = 0.0, 0.0
         
-    # --- Component 2: R=1 带预测值 Xhat2 ---
+    # --- Component 2: R=1 带预测值 Xhat4/Xhat5 ---
     if mask_r1_train.sum() > 0 and mask_r1_target.sum() > 0:
         cox_t_r1_hat = fit_cox_t(dt_train_proxy[mask_r1_train], x_cols)
         cox_c_r1_hat = fit_cox_c(dt_train_proxy[mask_r1_train], x_cols)
@@ -271,7 +321,7 @@ def compute_fold_theta_separate(
     else:
         ppi_t2_ipcw, ppi_t2_dr = 0.0, 0.0
         
-    # --- Component 3: R=1 带真实值 X2 (Classical) ---
+    # --- Component 3: R=1 带真实值 X4/X5 (Classical) ---
     if mask_r1_train.sum() > 0 and mask_r1_target.sum() > 0:
         cox_t_cla = fit_cox_t(dt_train[mask_r1_train], x_cols)
         cox_c_cla = fit_cox_c(dt_train[mask_r1_train], x_cols)
@@ -314,9 +364,10 @@ def run_single_sim(
     dt_inf = generate_data(n_inf, rng, tau=tau)
     r = rng.binomial(1, p_label, n_inf).astype(np.float64)
     
-    x2_hat = limix_impute_x2(pre, dt_inf, predictor)
+    x45_hat = limix_impute_x4x5(pre, dt_inf, predictor)
 
-    dt_inf["Xhat2"] = x2_hat
+    dt_inf["Xhat4"] = x45_hat[:, 0]
+    dt_inf["Xhat5"] = x45_hat[:, 1]
     dt_inf["R"] = r
 
     # --- Step 2: 将推断集随机均匀分为 A 和 B 两折 ---
@@ -388,14 +439,14 @@ def resolve_limiX_device(device_arg: str) -> torch.device:
     return torch.device(device_arg)
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Bivariate survival 2-Fold CF + SEPARATE Models")
-    p.add_argument("--m", type=int, default=30, help="Monte Carlo replicates")
+    p = argparse.ArgumentParser(description="Five-covariate survival 2-Fold CF + SEPARATE Models")
+    p.add_argument("--m", type=int, default=50, help="Monte Carlo replicates")
     p.add_argument("--seed-gold", type=int, default=999)
     p.add_argument("--theta-n", type=int, default=10_000_000)
     p.add_argument("--n-pre", type=int, default=500)
     p.add_argument("--n-inf", type=int, default=10000)
     p.add_argument("--p-label", type=float, default=0.1)
-    p.add_argument("--tau", type=float, default=1.3)
+    p.add_argument("--tau", type=float, default=1.4)
     p.add_argument("--model_path", type=str, default="")
     p.add_argument("--inference_config", type=str, default="")
     p.add_argument("--device", type=str, default="auto")
@@ -423,6 +474,7 @@ def main() -> None:
         device=dev,
         model_path=ck,
         inference_config=icfg,
+        mask_prediction=True,
         seed=args.predictor_seed,
     )
 
@@ -460,7 +512,7 @@ def main() -> None:
         "RMSE": np.round(rmse, 6),
     })
     
-    print(f"\n--- Final Results (2-Fold Limix + Separate Models(cox)) (M = {M}) ---\n")
+    print(f"\n--- Final Results (2-Fold LimiX MVI + Separate Models(cox)) (M = {M}) ---\n")
     print(f"missing rate: {1 - args.p_label}")
     print(f"censor rate: {censor_rate}")
     print(out.to_string(index=False))
