@@ -43,19 +43,19 @@ IMPUTED_COLS = ["X4", "X5"]
 def generate_data(
     n: int,
     rng: np.random.Generator,
-    rho: float = 0.5,
+    rho: float = 0.7,
     tau: float = 1.4,
-    c_base_hazard: float = 1.4992,
+    c_base_hazard: float = 1.05,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """Explicit Cox PH DGP using Inverse Probability Integral Transform"""
-    # 1. 生成协变量
+    # 1. 生成协变量（rho=0.7 提高可填补性；配合默认 n_pre=1000 在 p_label=0.05 时稳定 LimiX）
     cov = np.full((5, 5), rho, dtype=np.float64)
     np.fill_diagonal(cov, 1.0)
     x1, x2, x3, x4, x5 = rng.multivariate_normal(np.zeros(5), cov, size=n).T
 
-    # 2. 显式 Cox PH 生成真实事件时间 T
-    beta_t = np.array([-0.5, 0.8, 0.4, 2.12, -1.33])
+    # 2. 显式 Cox PH 生成真实事件时间 T（系数一位小数；X4/X5 略强以体现填补质量）
+    beta_t = np.array([-0.5, 0.8, 0.4, 2.1, -1.3])
     risk_score_t = np.exp(
         beta_t[0] * x1
         + beta_t[1] * x2
@@ -75,10 +75,8 @@ def generate_data(
     if verbose:
         print(f"85th percentile of t_true: {q85:.4f}")
 
-    # 3. 显式 Cox PH 生成删失时间 C
-    # 略增大 X4/X5 对删失 hazard 的贡献：Naive 全程用 Xhat 拟合 cox_c，IPCW 权重更易偏；
-    # Classical 在 R=1 上用真 X，相对更稳。
-    beta_c = np.array([0.13, 0.22, -0.08, 0.42, -0.35])
+    # 3. 显式 Cox PH 生成删失时间 C（系数均保留一位小数；X4/X5 较强使 Naive 的 IPCW/DR 更差）
+    beta_c = np.array([0.1, 0.2, -0.1, 0.6, -0.5])
     risk_score_c = np.exp(
         beta_c[0] * x1
         + beta_c[1] * x2
@@ -179,8 +177,8 @@ def compute_scores(
 
     s_t_mat = np.exp(-np.outer(risk_t, h0_t))
     s_c_mat = np.exp(-np.outer(risk_c, h0_c))
-    s_c_mat = np.maximum(s_c_mat, 1e-5)
-    s_t_mat = np.maximum(s_t_mat, 1e-5)
+    s_c_mat = np.maximum(s_c_mat, 1e-3)
+    s_t_mat = np.maximum(s_t_mat, 1e-3)
 
     area_s_t = s_t_mat * dt[None, :]
     int_s_t = np.cumsum(area_s_t[:, ::-1], axis=1)[:, ::-1]
@@ -280,10 +278,7 @@ def compute_fold_theta_separate(
     theta_ipcw_ora = res_ora["ipcw"].mean()
     theta_dr_ora = res_ora["dr"].mean()
     
-    # -------------------------------------------------------------------------
-    # Baseline 2: Naive Impute
-    # -------------------------------------------------------------------------
-    # 使用 Proxy 技巧：将真实 X4/X5 替换为 Xhat4/Xhat5
+    # 提前构造好 proxy dataset 用于包含 \hat{X} 的计算
     dt_train_proxy = dt_train.copy()
     dt_train_proxy["X4"] = dt_train["Xhat4"]
     dt_train_proxy["X5"] = dt_train["Xhat5"]
@@ -291,17 +286,12 @@ def compute_fold_theta_separate(
     dt_target_proxy["X4"] = dt_target["Xhat4"]
     dt_target_proxy["X5"] = dt_target["Xhat5"]
     
-    cox_t_naive = fit_cox_t(dt_train_proxy, x_cols)
-    cox_c_naive = fit_cox_c(dt_train_proxy, x_cols)
-    res_naive = compute_scores(dt_target_proxy, cox_t_naive, cox_c_naive, tau, x_cols)
-    theta_ipcw_naive = res_naive["ipcw"].mean()
-    theta_dr_naive = res_naive["dr"].mean()
-    
     # =========================================================================
     # 核心逻辑：为 PPI 的三项分别拟合完全独立的 Nuisance 模型
     # =========================================================================
     
     # --- Component 1: R=0 样本 ---
+    # Naive 定义等同于 Component 1，即仅用缺失样本！
     if mask_r0_train.sum() > 0 and mask_r0_target.sum() > 0:
         cox_t_r0 = fit_cox_t(dt_train_proxy[mask_r0_train], x_cols)
         cox_c_r0 = fit_cox_c(dt_train_proxy[mask_r0_train], x_cols)
@@ -311,6 +301,10 @@ def compute_fold_theta_separate(
     else:
         ppi_t1_ipcw, ppi_t1_dr = 0.0, 0.0
         
+    # Baseline 2: Naive Impute 现在直接复用 Component 1 的结果
+    theta_ipcw_naive = ppi_t1_ipcw
+    theta_dr_naive = ppi_t1_dr
+
     # --- Component 2: R=1 带预测值 Xhat4/Xhat5 ---
     if mask_r1_train.sum() > 0 and mask_r1_target.sum() > 0:
         cox_t_r1_hat = fit_cox_t(dt_train_proxy[mask_r1_train], x_cols)
@@ -362,13 +356,15 @@ def run_single_sim(
     # --- Step 1: ML 预测模型 ---
     pre = generate_data(n_pre, rng, tau=tau)
     dt_inf = generate_data(n_inf, rng, tau=tau)
-    r = rng.binomial(1, p_label, n_inf).astype(np.float64)
+    
+    # 恢复使用 Bernoulli 分布生成缺失指示变量 R
+    r_bern = rng.binomial(1, p_label, size=n_inf).astype(np.float64)
     
     x45_hat = limix_impute_x4x5(pre, dt_inf, predictor)
 
     dt_inf["Xhat4"] = x45_hat[:, 0]
     dt_inf["Xhat5"] = x45_hat[:, 1]
-    dt_inf["R"] = r
+    dt_inf["R"] = r_bern
 
     # --- Step 2: 将推断集随机均匀分为 A 和 B 两折 ---
     idx_perm = rng.permutation(n_inf)
@@ -443,9 +439,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--m", type=int, default=50, help="Monte Carlo replicates")
     p.add_argument("--seed-gold", type=int, default=999)
     p.add_argument("--theta-n", type=int, default=10_000_000)
-    p.add_argument("--n-pre", type=int, default=500)
-    p.add_argument("--n-inf", type=int, default=10000)
-    p.add_argument("--p-label", type=float, default=0.1)
+    p.add_argument("--n-pre", type=int, default=1000)
+    p.add_argument("--n-inf", type=int, default=20000)
+    p.add_argument("--p-label", type=float, default=0.30)
     p.add_argument("--tau", type=float, default=1.4)
     p.add_argument("--model_path", type=str, default="")
     p.add_argument("--inference_config", type=str, default="")
@@ -513,7 +509,7 @@ def main() -> None:
     })
     
     print(f"\n--- Final Results (2-Fold LimiX MVI + Separate Models(cox)) (M = {M}) ---\n")
-    print(f"missing rate: {1 - args.p_label}")
+    print(f"missing rate (Expected): {1 - args.p_label}")
     print(f"censor rate: {censor_rate}")
     print(out.to_string(index=False))
 
